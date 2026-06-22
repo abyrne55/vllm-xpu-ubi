@@ -1,18 +1,24 @@
 ######################### RUST BUILD IMAGE #########################
 # Build the Rust frontend (`vllm-rs`) in a dedicated stage so the main image
-# doesn't need the rust toolchain. Runs in parallel with vllm-base.
-FROM ubuntu:22.04 AS rust-build-cache
-ENV DEBIAN_FRONTEND=noninteractive
+# doesn't need the rust toolchain or protoc. Runs in parallel with vllm-base.
+FROM registry.access.redhat.com/ubi10/ubi:10.2 AS rust-build
 
-RUN apt-get update -y \
-    && apt-get install -y --no-install-recommends \
-        ca-certificates curl git build-essential python3 python3-pip \
-    && rm -rf /var/lib/apt/lists/*
+RUN dnf install -y --nodocs \
+        ca-certificates curl git gcc gcc-c++ make openssl-devel \
+        pkgconf-pkg-config python3 python3-pip unzip \
+    && pip3 install --no-cache-dir setuptools setuptools-rust \
+    && dnf clean all
+
+COPY tools/install_protoc.sh /tmp/install_protoc.sh
+RUN /tmp/install_protoc.sh && rm /tmp/install_protoc.sh
 
 WORKDIR /workspace
 
-COPY requirements/build/rust.txt requirements/build/rust.txt
-RUN python3 -m pip install --no-cache-dir -r requirements/build/rust.txt
+# [UBI] Install rustup; upstream uses requirements/build/rust.txt instead.
+# The toolchain itself is pinned by rust-toolchain.toml.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+    sh -s -- -y --profile minimal --default-toolchain none
+ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Copy only the Rust build inputs; build_rust.sh publishes artifacts needed
 # by the wheel build stage.
@@ -25,65 +31,100 @@ COPY build_rust.sh build_rust.sh
 # (rustc spawns enough concurrent processes to hit RLIMIT_NOFILE otherwise).
 ENV CARGO_BUILD_JOBS=4
 
-# Build with a stable version so this target snapshot is keyed only by Rust
-# inputs. The child stage below relinks the crates that embed the exact version.
-RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
-    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
-    SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0+docker.cache" bash build_rust.sh
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/workspace/rust/target \
+    OPENSSL_NO_VENDOR=1 bash build_rust.sh
 
-# Relink with the exact Git-derived package version.
-FROM rust-build-cache AS rust-build
+FROM registry.access.redhat.com/ubi10/ubi:10.2 AS vllm-base
 
-RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
-    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
-    --mount=type=bind,source=.git,target=.git \
-    SETUPTOOLS_SCM_PRETEND_METADATA="{dirty=false}" bash build_rust.sh
-
-FROM ubuntu:24.04 AS vllm-base
-
-ENV DEBIAN_FRONTEND=noninteractive
+# ── Section A: base environment (mirrors upstream vllm-base) ─────────
 
 WORKDIR /workspace/
 
 ARG PYTHON_VERSION=3.12
 ARG PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/xpu"
 
-RUN apt-get update -y && \
-    apt-get install -y --no-install-recommends \
-    build-essential \
-    curl \
-    ffmpeg \
-    git \
-    gpg \
-    libsndfile1 \
-    libsm6 \
-    libxext6 \
-    libgl1 \
-    lsb-release \
-    libaio-dev \
-    numactl \
-    wget \
-    vim \
-    ca-certificates \
-    python3.12 \
-    python3.12-dev \
-    python3-pip && \
-    rm -rf /var/lib/apt/lists/*
+# [UBI] Install EPEL, enable CRB (for -devel packages), then install
+# system packages. binutils provides `ar` for .deb extraction;
+# zstd for .tar.zst inside .debs.
+RUN dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm && \
+    /usr/bin/crb enable && \
+    dnf install -y --nodocs \
+        binutils \
+        curl \
+        gcc \
+        gcc-c++ \
+        git \
+        libaio \
+        libSM \
+        libsndfile \
+        libXext \
+        make \
+        mesa-libGL \
+        numactl \
+        python3 \
+        python3-devel \
+        python3-pip \
+        vim \
+        wget \
+        xz \
+        zstd \
+    && dnf clean all
 
-# Install UMD
-RUN mkdir neo && \
-    cd neo && \
-    wget https://github.com/intel/intel-graphics-compiler/releases/download/v2.38.2/intel-igc-core-2_2.38.2+22051_amd64.deb && \
-    wget https://github.com/intel/intel-graphics-compiler/releases/download/v2.38.2/intel-igc-opencl-2_2.38.2+22051_amd64.deb && \
-    wget https://github.com/intel/compute-runtime/releases/download/26.27.39122.11/intel-ocloc_26.27.39122.11-0_amd64.deb && \
-    wget https://github.com/intel/compute-runtime/releases/download/26.27.39122.11/intel-opencl-icd_26.27.39122.11-0_amd64.deb && \
-    wget https://github.com/intel/compute-runtime/releases/download/26.27.39122.11/libigdgmm12_22.10.0_amd64.deb && \
-    wget https://github.com/intel/compute-runtime/releases/download/26.27.39122.11/libze-intel-gpu1_26.27.39122.11-0_amd64.deb && \
-    wget https://github.com/oneapi-src/level-zero/releases/download/v1.32.0/libze1_1.32.0+u24.04_amd64.deb && \
-    wget https://github.com/oneapi-src/level-zero/releases/download/v1.32.0/libze-dev_1.32.0+u24.04_amd64.deb && \
-    dpkg -i *.deb && \
-    cd .. && \
-    rm -rf neo
+# [UBI] Add Intel oneAPI YUM repo and install pinned packages.
+RUN rpm --import https://yum.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB && \
+    printf '%s\n' \
+        '[oneAPI]' \
+        'name=Intel oneAPI' \
+        'baseurl=https://yum.repos.intel.com/oneapi' \
+        'enabled=1' \
+        'gpgcheck=1' \
+        'gpgkey=https://yum.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB' \
+        > /etc/yum.repos.d/oneAPI.repo && \
+    dnf install -y --nodocs \
+        intel-oneapi-compiler-dpcpp-cpp-2025.3 \
+        intel-oneapi-mkl-devel-2025.3 \
+        intel-oneapi-dnnl-devel-2025.3 \
+    && dnf clean all
+
+# [UBI] Install GPU drivers from upstream .deb packages (Intel only publishes .deb).
+# Extract with ar/tar then copy libraries to RHEL's /usr/lib64/.
+# IGC installs to /usr/local/lib/; GMM/LZ/CR install to /usr/lib/x86_64-linux-gnu/.
+ARG IGC_VERSION=2.34.4
+ARG IGC_BUILD=21428
+ARG CR_VERSION=26.18.38308.1
+ARG GMM_VERSION=22.10.0
+ARG LZ_VERSION=1.29.0
+
+RUN mkdir /tmp/neo && cd /tmp/neo && \
+    curl -LO "https://github.com/intel/intel-graphics-compiler/releases/download/v${IGC_VERSION}/intel-igc-core-2_${IGC_VERSION}+${IGC_BUILD}_amd64.deb" && \
+    curl -LO "https://github.com/intel/intel-graphics-compiler/releases/download/v${IGC_VERSION}/intel-igc-opencl-2_${IGC_VERSION}+${IGC_BUILD}_amd64.deb" && \
+    curl -LO "https://github.com/intel/compute-runtime/releases/download/${CR_VERSION}/intel-ocloc_${CR_VERSION}-0_amd64.deb" && \
+    curl -LO "https://github.com/intel/compute-runtime/releases/download/${CR_VERSION}/intel-opencl-icd_${CR_VERSION}-0_amd64.deb" && \
+    curl -LO "https://github.com/intel/compute-runtime/releases/download/${CR_VERSION}/libigdgmm12_${GMM_VERSION}_amd64.deb" && \
+    curl -LO "https://github.com/intel/compute-runtime/releases/download/${CR_VERSION}/libze-intel-gpu1_${CR_VERSION}-0_amd64.deb" && \
+    curl -LO "https://github.com/oneapi-src/level-zero/releases/download/v${LZ_VERSION}/libze1_${LZ_VERSION}+u24.04_amd64.deb" && \
+    curl -LO "https://github.com/oneapi-src/level-zero/releases/download/v${LZ_VERSION}/libze-dev_${LZ_VERSION}+u24.04_amd64.deb" && \
+    for deb in *.deb; do \
+        ar x "$deb" && \
+        tar xf data.tar.* -C / && \
+        rm -f control.tar.* data.tar.* debian-binary "$deb"; \
+    done && \
+    cp -an /usr/local/lib/*.so* /usr/lib64/ 2>/dev/null || true && \
+    cp -an /usr/lib/x86_64-linux-gnu/*.so* /usr/lib64/ 2>/dev/null || true && \
+    cp -an /usr/lib/x86_64-linux-gnu/intel-opencl/* /usr/lib64/ 2>/dev/null || true && \
+    ldconfig && \
+    ls /usr/lib64/libigc.so* && \
+    ls /usr/lib64/libigdgmm.so* && \
+    ls /usr/lib64/libze_loader.so* && \
+    ls /usr/lib64/libze_intel_gpu.so* && \
+    rm -rf /tmp/neo && \
+    mkdir -p /opt/gpu-libs/lib64 /opt/gpu-libs/etc/OpenCL/vendors && \
+    for pattern in libigc libigdfcl libiga64 libigdgmm libze_loader libze_intel_gpu; do \
+        cp -a /usr/lib64/${pattern}*.so* /opt/gpu-libs/lib64/ 2>/dev/null || true; \
+    done && \
+    cp -a /etc/OpenCL/vendors/* /opt/gpu-libs/etc/OpenCL/vendors/ 2>/dev/null || true
 
 # Install XPU-Manager payloads without registering conflicting libze package
 # dependencies in dpkg.
@@ -94,8 +135,11 @@ RUN apt-get update -y && \
     apt-get install -y --no-install-recommends libhwloc15 libpciaccess0 libigsc1 intel-metrics-library && \
     mkdir xpu-m && \
     cd xpu-m && \
-    wget https://github.com/intel/xpumanager/releases/download/v2.1.0/xpu-smi_2.1.0+26.33.6468cec-1.24.04_amd64.deb && \
-    apt install -y ./xpu-smi_2.1.0+26.33.6468cec-1.24.04_amd64.deb --install-suggests && \
+    wget https://github.com/intel/xpumanager/releases/download/v2.0.0/libxpum2_2.0.0-238.24.04_amd64.deb && \
+    wget https://github.com/intel/xpumanager/releases/download/v2.0.0/xpu-smi_2.0.0-238.24.04_amd64.deb && \
+    dpkg-deb -x libxpum2_2.0.0-238.24.04_amd64.deb / && \
+    dpkg-deb -x xpu-smi_2.0.0-238.24.04_amd64.deb / && \
+    ldconfig && \
     cd .. && \
     rm -rf xpu-m && \
     add-apt-repository --remove -y ppa:kobuk-team/intel-graphics && \
@@ -107,6 +151,26 @@ ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
     && uv venv --python ${PYTHON_VERSION} --seed ${VIRTUAL_ENV}
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+# This oneccl contains the BMG support which is not the case for default version of oneapi 2025.3.
+ARG ONECCL_INSTALLER="intel-oneccl-2021.15.9.14_offline.sh"
+RUN wget "https://github.com/uxlfoundation/oneCCL/releases/download/2021.15.9/${ONECCL_INSTALLER}" && \
+    bash "${ONECCL_INSTALLER}" -a --silent --eula accept && \
+    rm "${ONECCL_INSTALLER}" && \
+    echo "source /opt/intel/oneapi/setvars.sh --force" >> /root/.bashrc && \
+    echo "source /opt/intel/oneapi/ccl/2021.15/env/vars.sh --force" >> /root/.bashrc && \
+    rm -f /opt/intel/oneapi/ccl/latest && \
+    ln -s /opt/intel/oneapi/ccl/2021.15 /opt/intel/oneapi/ccl/latest
+
+# [UBI] oneAPI environment (upstream inherits from base image).
+ENV ONEAPI_ROOT="/opt/intel/oneapi"
+ENV CMPLR_ROOT="/opt/intel/oneapi/compiler/2025.3"
+ENV MKLROOT="/opt/intel/oneapi/mkl/2025.3"
+ENV DNNLROOT="/opt/intel/oneapi/dnnl/2025.3"
+ENV CCL_ROOT="/opt/intel/oneapi/ccl/2021.15"
+ENV CCL_CONFIGURATION="cpu_gpu_dpcpp"
+ENV OCL_ICD_FILENAMES="/opt/intel/oneapi/compiler/2025.3/lib/libintelocl.so"
+ENV LD_LIBRARY_PATH="/opt/intel/oneapi/ccl/2021.15/lib:/opt/intel/oneapi/compiler/2025.3/lib:/opt/intel/oneapi/compiler/2025.3/opt/compiler/lib:/opt/intel/oneapi/mkl/2025.3/lib:/opt/intel/oneapi/dnnl/2025.3/lib:/opt/intel/oneapi/tbb/2022.3/lib/intel64/gcc4.8:/opt/intel/oneapi/tcm/1.4/lib:/opt/intel/oneapi/umf/1.0/lib"
 
 SHELL ["bash", "-c"]
 CMD ["bash", "-c", "source /root/.bashrc && exec bash"]
@@ -127,59 +191,39 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --upgrade pip
 
 
-ENV LD_LIBRARY_PATH=/opt/venv/lib:/usr/local/lib
+
+ENV LD_LIBRARY_PATH="$LD_LIBRARY_PATH:/usr/local/lib/"
+
+# [UBI] Strip oneAPI build-time artifacts not needed at runtime.
+# Preserve compiler libs + headers for Triton XPU JIT (icpx -fsycl).
+RUN find /opt/intel/oneapi -name '*.a' ! -path '*/compiler/*' -delete && \
+    find /opt/intel/oneapi -type d -name include \
+        ! -path '*/compiler/*/include' \
+        ! -path '*/clang/*/include' \
+        -exec rm -rf {} + 2>/dev/null || true && \
+    rm -rf /opt/intel/oneapi/installer \
+           /opt/intel/oneapi/debugger && \
+    find /opt/intel/oneapi -type d \
+        \( -name cmake -o -name pkgconfig -o -name samples -o -name examples \) \
+        -exec rm -rf {} + 2>/dev/null || true
+
 CMD ["/bin/bash"]
 
 ######################### UCX + NIXL BUILD STAGE #########################
 # Build UCX and NIXL in a dedicated stage so compiler/autotools layers are
 # never included in the final runtime image (mirrors ROCm's build_rixl stage).
-######################### WHEEL BUILD STAGE #########################
-# Produces a standalone dist/*.whl artifact (used by the release pipeline's
-# "Build wheel - XPU" step), independent of the runtime image below.
-FROM vllm-base AS vllm-build
-
-ARG GIT_REPO_CHECK=0
-
-RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=bind,src=requirements/common.txt,target=/workspace/vllm/requirements/common.txt \
-    --mount=type=bind,src=requirements/xpu.txt,target=/workspace/vllm/requirements/xpu.txt \
-    uv pip install grpcio-tools protobuf nanobind && \
-    uv pip install -r /workspace/vllm/requirements/xpu.txt
-
-# Keep source-dependent layers near the end so frequent code-only changes
-# don't invalidate heavy dependency layers.
-COPY . .
-
-# Drop the pre-built Rust artifacts into the source tree. setup.py detects
-# them and ships them as-is, skipping the local Rust build.
-COPY --from=rust-build /workspace/vllm/vllm-rs vllm/vllm-rs
-COPY --from=rust-build /workspace/vllm/_rust_*.so vllm/
-
-RUN --mount=type=bind,source=.git,target=.git \
-    if [ "$GIT_REPO_CHECK" != 0 ]; then bash tools/check_repo.sh; fi
-
-RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=bind,source=.git,target=.git \
-    VLLM_TARGET_DEVICE=xpu python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38
-
 FROM vllm-base AS ucx-nixl-build
 
-# Keep UCX_VERSION aligned with the UCX that NIXL itself builds against for this
-# NIXL_VERSION (nixl contrib/Dockerfile.manylinux: ARG UCX_REF), so XPU runs the
-# same UCX commit as the released nixl-cu* wheels rather than an untested pairing.
-ARG UCX_VERSION=v1.21.x
-ARG NIXL_VERSION=v1.3.2
+ARG UCX_VERSION=v1.21.0-rc2
+ARG NIXL_VERSION=v1.2.0
 
 # Build-time only: compiler, autotools, and verbs dev headers
-RUN apt-get update -y && apt-get install -y --no-install-recommends \
-    build-essential \
-    autoconf \
-    automake \
-    libtool \
-    pkg-config \
-    libibverbs-dev \
-    librdmacm-dev \
-    && rm -rf /var/lib/apt/lists/*
+RUN dnf install -y --nodocs \
+        autoconf \
+        automake \
+        libtool \
+        rdma-core-devel \
+    && dnf clean all
 
 # Build UCX and produce a NIXL wheel so the final image needs no compiler.
 # patchelf (installed via uv) is used by the NIXL wheel build to rewrite
@@ -188,50 +232,27 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     git clone --depth 1 --branch "${UCX_VERSION}" https://github.com/openucx/ucx /tmp/ucx_source && \
     cd /tmp/ucx_source && \
     bash autogen.sh && \
-    ./configure --prefix=/opt/ucx --with-ze=yes --enable-examples --enable-mt && \
+    ./configure --prefix=/tmp/ucx_install --with-ze=yes --enable-examples --enable-mt && \
     make CFLAGS="-Wno-error=incompatible-pointer-types" -j"$(nproc)" && make install && \
     git clone --depth 1 --branch "${NIXL_VERSION}" https://github.com/ai-dynamo/nixl /tmp/nixl_source && \
     cd /tmp/nixl_source && \
     uv pip install --upgrade meson pybind11 patchelf && \
     uv pip install -r requirements.txt && \
-    PKG_CONFIG_PATH=/opt/ucx/lib/pkgconfig \
-    LD_LIBRARY_PATH=/opt/ucx/lib \
+    PKG_CONFIG_PATH=/tmp/ucx_install/lib/pkgconfig \
+    LD_LIBRARY_PATH=/tmp/ucx_install/lib \
     python -m pip wheel --no-deps . -w /tmp/nixl_wheels/ && \
-    find /opt/ucx -type f \( -name '*.a' -o -name '*.la' \) -delete && \
-    rm -rf /opt/ucx/{include,share,etc} /opt/ucx/lib/cmake \
+    find /tmp/ucx_install -type f \( -name '*.a' -o -name '*.la' \) -delete && \
+    rm -rf /tmp/ucx_install/{include,share,etc,bin} /tmp/ucx_install/lib/cmake \
            /tmp/ucx_source /tmp/nixl_source
 
-FROM vllm-base AS vllm-openai
+######################### BUILD VLLM STAGE #########################
+# [UBI] Upstream builds vllm inside vllm-openai (which inherits the full
+# compiler toolchain from its base image). Our vllm-openai is FROM
+# ubi-minimal and cannot compile, so we build in a dedicated stage and
+# COPY the venv into the runtime image.
+FROM vllm-base AS vllm-build
 
-# Must match the ucx-nixl-build stage above: ARG does not cross stages, so a stale
-# value here installs a meta package that disagrees with the wheel built there.
-ARG NIXL_VERSION=v1.3.2
-
-# Copy compiled UCX runtime libraries and the pre-built NIXL wheel.
-# No compiler or autotools are installed in this stage.
-COPY --from=ucx-nixl-build /opt/ucx /opt/ucx
-COPY --from=ucx-nixl-build /tmp/nixl_wheels /tmp/nixl_wheels
-
-ENV LD_LIBRARY_PATH=/opt/ucx/lib:${LD_LIBRARY_PATH}
-
-# Install RDMA runtime libraries (no build tools) and the pre-built NIXL wheel.
-# Do not uninstall/reinstall large Python packages here to avoid extra layer
-# churn; final package resolution remains in the later app install step.
-RUN --mount=type=cache,target=/root/.cache/uv \
-    apt-get update -y && apt-get install -y --no-install-recommends \
-    rdma-core \
-    libibverbs1 \
-    librdmacm1 \
-    libibumad3 \
-    libibmad5 \
-    libmlx5-1 \
-    libmlx4-1 \
-    ibverbs-providers \
-    librdmacm1t64 \
-    && rm -rf /var/lib/apt/lists/* \
-    && uv pip install --no-deps /tmp/nixl_wheels/nixl*.whl \
-    && uv pip install --no-deps nixl==${NIXL_VERSION} \
-    && rm -rf /tmp/nixl_wheels
+WORKDIR /workspace/vllm
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,src=requirements/common.txt,target=/workspace/vllm/requirements/common.txt \
@@ -239,7 +260,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,src=requirements/test/xpu.txt,target=/workspace/vllm/requirements/test/xpu.txt \
     uv pip install grpcio-tools protobuf nanobind && \
     uv pip install -r /workspace/vllm/requirements/xpu.txt && \
-    uv pip install --no-build-isolation -r /workspace/vllm/requirements/test/xpu.txt
+    uv pip install --no-build-isolation -r /workspace/vllm/requirements/test/xpu.txt && \
+    uv pip uninstall triton triton-xpu && \
+    uv pip install triton-xpu==3.7.1 && \
+    uv pip uninstall oneccl oneccl-devel && \
+    source /opt/intel/oneapi/setvars.sh --force && \
+    source /opt/intel/oneapi/ccl/2021.15/env/vars.sh --force && \
+    export CMAKE_PREFIX_PATH="$(python3 -c 'import site; print(site.getsitepackages()[0])'):${CMAKE_PREFIX_PATH}"
 
 # Keep source-dependent layers near the end so frequent code-only changes
 # don't invalidate heavy dependency and UCX/NIXL layers.
@@ -262,6 +289,87 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --no-build-isolation --no-deps .
 
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install -e tests/vllm_test_utils
+    uv pip install tests/vllm_test_utils
+
+######################### RUNTIME STAGE #########################
+# Minimal runtime image -- no autotools, no -devel packages.
+# gcc/g++ kept for Triton XPU JIT.
+FROM registry.access.redhat.com/ubi10/ubi-minimal:10.2 AS vllm-openai
+
+WORKDIR /workspace/vllm
+
+# Runtime packages only
+# gcc/g++ are required at runtime by Triton XPU for JIT kernel compilation
+RUN microdnf install -y --nodocs \
+        python3 \
+        python3-devel \
+        gcc \
+        gcc-c++ \
+        curl \
+        tar \
+        findutils \
+        numactl \
+        libaio \
+        libSM \
+        libXext \
+        mesa-libGL \
+        libsndfile \
+        libibverbs \
+        net-tools \
+        pciutils \
+    && microdnf clean all
+
+# Complete Python venv (vllm + test_utils + triton fix + oneccl removed)
+COPY --from=vllm-build /opt/venv /opt/venv
+
+# Intel oneAPI runtime
+COPY --from=vllm-base /opt/intel/oneapi /opt/intel/oneapi
+
+# [UBI] GPU driver shared libraries and Level Zero headers (Triton XPU JIT)
+COPY --from=vllm-base /opt/gpu-libs/lib64/ /usr/lib64/
+COPY --from=vllm-base /opt/gpu-libs/etc/OpenCL/ /etc/OpenCL/
+COPY --from=vllm-base /usr/include/level_zero/ /usr/include/level_zero/
+
+# Interactive shell config (sources setvars.sh)
+COPY --from=vllm-base /root/.bashrc /root/.bashrc
+
+# UCX runtime libs (keep same path -- NIXL's .so RPATHs expect it)
+COPY --from=ucx-nixl-build /tmp/ucx_install/lib/ /tmp/ucx_install/lib/
+
+# NIXL wheel
+COPY --from=ucx-nixl-build /tmp/nixl_wheels/ /tmp/nixl_wheels/
+
+ENV VIRTUAL_ENV="/opt/venv"
+ENV PATH="$VIRTUAL_ENV/bin:/root/.local/bin:$PATH"
+
+ARG NIXL_VERSION=v1.2.0
+
+# Install NIXL from pre-built wheel, then clean up
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
+    uv pip install --no-deps /tmp/nixl_wheels/nixl*.whl && \
+    uv pip install nixl==${NIXL_VERSION} && uv pip uninstall nixl-cu13 && \
+    rm -rf /tmp/nixl_wheels
+
+RUN ldconfig
+
+ENV ONEAPI_ROOT="/opt/intel/oneapi"
+ENV CMPLR_ROOT="/opt/intel/oneapi/compiler/2025.3"
+ENV MKLROOT="/opt/intel/oneapi/mkl/2025.3"
+ENV DNNLROOT="/opt/intel/oneapi/dnnl/2025.3"
+ENV CCL_ROOT="/opt/intel/oneapi/ccl/2021.15"
+ENV CCL_CONFIGURATION="cpu_gpu_dpcpp"
+ENV OCL_ICD_FILENAMES="/opt/intel/oneapi/compiler/2025.3/lib/libintelocl.so"
+
+ENV LD_LIBRARY_PATH="/opt/intel/oneapi/ccl/2021.15/lib:/opt/intel/oneapi/compiler/2025.3/lib:/opt/intel/oneapi/compiler/2025.3/opt/compiler/lib:/opt/intel/oneapi/mkl/2025.3/lib:/opt/intel/oneapi/dnnl/2025.3/lib:/opt/intel/oneapi/tbb/2022.3/lib/intel64/gcc4.8:/opt/intel/oneapi/tcm/1.4/lib:/opt/intel/oneapi/umf/1.0/lib:/tmp/ucx_install/lib:/usr/local/lib/"
+
+ENV VLLM_TARGET_DEVICE=xpu
+ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
+
+ARG PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/xpu"
+ENV PIP_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}
+ENV UV_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}
+ENV UV_INDEX_STRATEGY="unsafe-best-match"
+ENV UV_LINK_MODE="copy"
+ENV UV_HTTP_TIMEOUT=500
 
 ENTRYPOINT ["vllm", "serve"]
