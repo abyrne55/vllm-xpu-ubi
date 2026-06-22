@@ -1,0 +1,219 @@
+name: Rebase on upstream and build XPU image
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force build even if image already exists for this SHA'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: rebase-and-build
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: write
+  issues: write
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    outputs:
+      upstream_sha: ${{ steps.rebase.outputs.upstream_sha }}
+      merge_base: ${{ steps.rebase.outputs.merge_base }}
+      status: ${{ steps.rebase.outputs.status }}
+      dockerfile_changed: ${{ steps.rebase.outputs.dockerfile_changed }}
+    steps:
+      - name: Checkout with full history
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Rebase onto upstream
+        id: rebase
+        run: |
+          git remote add upstream https://github.com/vllm-project/vllm.git
+          git fetch upstream main
+
+          UPSTREAM_SHA=$(git rev-parse upstream/main)
+          MERGE_BASE=$(git merge-base HEAD upstream/main)
+
+          echo "upstream_sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
+          echo "merge_base=${MERGE_BASE}" >> "$GITHUB_OUTPUT"
+
+          if [ "${UPSTREAM_SHA}" = "${MERGE_BASE}" ]; then
+            echo "status=skipped" >> "$GITHUB_OUTPUT"
+            echo "dockerfile_changed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Already up-to-date with upstream/main (${UPSTREAM_SHA:0:12})"
+            exit 0
+          fi
+
+          if ! git diff --quiet "${MERGE_BASE}" upstream/main -- docker/Dockerfile.xpu; then
+            echo "dockerfile_changed=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Upstream modified docker/Dockerfile.xpu since ${MERGE_BASE:0:12}"
+          else
+            echo "dockerfile_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "::notice::Rebasing onto upstream/main (${MERGE_BASE:0:12} -> ${UPSTREAM_SHA:0:12})"
+
+          if git rebase upstream/main; then
+            echo "status=rebased" >> "$GITHUB_OUTPUT"
+            CURRENT_BRANCH=$(git branch --show-current)
+            git push --force-with-lease origin "${CURRENT_BRANCH}"
+          else
+            CONFLICTED=$(git diff --name-only --diff-filter=U)
+            NON_DOCKERFILE=$(echo "${CONFLICTED}" | grep -v '^docker/Dockerfile\.xpu$' || true)
+
+            if [ -n "${NON_DOCKERFILE}" ]; then
+              git rebase --abort
+              echo "status=failed" >> "$GITHUB_OUTPUT"
+              echo "::error::Rebase failed — conflicts in files other than Dockerfile.xpu: ${NON_DOCKERFILE}"
+              exit 1
+            fi
+
+            echo "::warning::Auto-resolving docker/Dockerfile.xpu conflict (keeping ours)"
+            git checkout --theirs docker/Dockerfile.xpu
+            git add docker/Dockerfile.xpu
+
+            if GIT_EDITOR=true git rebase --continue; then
+              echo "status=rebased" >> "$GITHUB_OUTPUT"
+              CURRENT_BRANCH=$(git branch --show-current)
+              git push --force-with-lease origin "${CURRENT_BRANCH}"
+            else
+              git rebase --abort
+              echo "status=failed" >> "$GITHUB_OUTPUT"
+              echo "::error::Rebase failed after auto-resolving Dockerfile.xpu"
+              exit 1
+            fi
+          fi
+
+      - name: Open issue on rebase failure
+        if: failure() && steps.rebase.outputs.status == 'failed'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TITLE="Rebase failure: conflicts with upstream vllm-project/vllm"
+          EXISTING=$(gh issue list --repo "${{ github.repository }}" --state open --search "${TITLE}" --json number --jq '.[0].number')
+          if [ -n "${EXISTING}" ]; then
+            echo "::notice::Issue #${EXISTING} already open — skipping"
+          else
+            gh issue create --repo "${{ github.repository }}" \
+              --title "${TITLE}" \
+              --body "The scheduled rebase onto upstream \`vllm-project/vllm\` main failed due to conflicts.
+
+          **Upstream SHA:** \`${{ steps.rebase.outputs.upstream_sha }}\`
+          **Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          Please resolve the conflicts manually and force-push."
+          fi
+
+      - name: Notify upstream Dockerfile.xpu changes
+        if: always() && steps.rebase.outputs.dockerfile_changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TITLE="Upstream modified docker/Dockerfile.xpu — review needed"
+          EXISTING=$(gh issue list --repo "${{ github.repository }}" --state open --search "${TITLE}" --json number --jq '.[0].number')
+          if [ -n "${EXISTING}" ]; then
+            echo "::notice::Issue #${EXISTING} already open — skipping"
+          else
+            UPSTREAM_SHA="${{ steps.rebase.outputs.upstream_sha }}"
+            MERGE_BASE="${{ steps.rebase.outputs.merge_base }}"
+            gh issue create --repo "${{ github.repository }}" \
+              --title "${TITLE}" \
+              --body "Upstream \`vllm-project/vllm\` modified \`docker/Dockerfile.xpu\` since the last merge base.
+
+          **Upstream SHA:** \`${UPSTREAM_SHA}\`
+          **Merge base:** \`${MERGE_BASE}\`
+          **Compare:** https://github.com/vllm-project/vllm/compare/${MERGE_BASE:0:12}...${UPSTREAM_SHA:0:12} (look at \`docker/Dockerfile.xpu\`)
+          **Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          Review the upstream changes and decide if our UBI-based Dockerfile.xpu needs updates."
+          fi
+
+  build:
+    needs: rebase
+    if: needs.rebase.outputs.status != 'failed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/vllm-xpu-ubi
+    steps:
+      - name: Check if image already exists
+        id: check
+        run: |
+          SHORT_SHA=$(echo "${{ needs.rebase.outputs.upstream_sha }}" | cut -c1-12)
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+          if [ "${{ inputs.force_build }}" = "true" ]; then
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Force build requested — skipping image check"
+            exit 0
+          fi
+
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            "https://ghcr.io/v2/${{ github.repository_owner }}/vllm-xpu-ubi/manifests/${SHORT_SHA}" \
+            -H "Accept: application/vnd.oci.image.index.v1+json")
+
+          if [ "${STATUS}" = "200" ]; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Image already exists for ${SHORT_SHA} — skipping build"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Free disk space
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          echo "::group::Disk usage before cleanup"
+          df -h /
+          echo "::endgroup::"
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/share/boost /usr/local/graalvm /usr/local/.ghcup \
+            /opt/hostedtoolcache
+          sudo docker image prune -af
+          echo "::group::Disk usage after cleanup"
+          df -h /
+          echo "::endgroup::"
+
+      - name: Checkout
+        if: steps.check.outputs.needed == 'true'
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        if: steps.check.outputs.needed == 'true'
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        if: steps.check.outputs.needed == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        if: steps.check.outputs.needed == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile.xpu
+          target: vllm-openai
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ steps.check.outputs.short_sha }}
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
